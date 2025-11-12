@@ -1,102 +1,73 @@
 # utils.py
 """
-Вспомогательные функции:
-- text_norm: нормализация строки
-- detect_type: определяет тип объекта по ключевым словам
-- is_south: проверяет присутствие локаций юга Тенерифе
-- is_price_ok: проверка по текущим user limits (user_limits.py) или PRICE_THRESHOLDS
-- save_to_csv: сохранение кандидатов в outputs/
+Улучшенные утилиты для Tenerife RealEstate Bot.
+
+Функции:
+- text_norm(s)
+- detect_type(item)
+- is_south(item)
+- explain_is_south(item)  # для отладки
+- normalize_price(v)
+- is_price_ok(item)
+- save_to_csv(items, filename=None)
+
+Зависимости: стандартная библиотека.
 """
 
 import re
 import os
 import csv
+import math
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import config
 from user_limits import user_price_limits
 
+# --- Параметры нечёткого сравнения ---
+FUZZY_THRESHOLD = float(os.getenv("FUZZY_THRESHOLD", 0.86))  # >= -> считать совпадением
+TOKEN_FUZZY_THRESHOLD = float(os.getenv("TOKEN_FUZZY_THRESHOLD", 0.92))
+
+# --- Вспомогательные (haversine) ---
+def _haversine_km(lat1, lon1, lat2, lon2):
+    # Returns distance in kilometers
+    R = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+# --- Нормализация текста ---
 def text_norm(s):
-    if not s:
+    if s is None:
         return ""
     s = str(s).lower()
-    # оставить буквы/цифры/пробел/диакритику
-    s = re.sub(r'[^0-9a-zа-яё\u00C0-\u017F\s\-]', ' ', s)
+    # keep letters (latin + accented), digits, spaces and hyphen
+    s = re.sub(r'[^0-9a-zа-яё\u00C0-\u017F\s\-\.,]', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
+
+def _tokens(s):
+    return [t for t in re.split(r'[\s,;:/\-]+', text_norm(s)) if t]
 
 def contains_any(text, keywords):
     txt = text_norm(text)
     for k in keywords:
-        if k in txt:
+        if k and k in txt:
             return True
     return False
 
+# --- Нечёткая похожесть ---
+def _similar(a, b):
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+# --- Определение типа объекта ---
 def detect_type(item):
     """
-    Вернёт одну из ключей TYPE_KEYWORDS ('land','rural_house','villa','finca') или None.
-    Ищем совпадения в title, address, description.
-    """
-    text = " ".join([
-        str(item.get("title","") or ""),
-        str(item.get("address","") or ""),
-        str(item.get("description","") or "")
-    ])
-    txt = text_norm(text)
-    for t, keys in config.TYPE_KEYWORDS.items():
-        for k in keys:
-            if k in txt:
-                return t
-    return None
-
-def is_south(item):
-    txt = text_norm(" ".join([item.get("address","") or "", item.get("title","") or ""]))
-    for kw in config.SOUTH_KEYWORDS:
-        if kw in txt:
-            return True
-    return False
-
-def is_price_ok(item):
-    t = item.get("detected_type")
-    price = item.get("price")
-    if not t or price is None:
-        return False
-    try:
-        p = int(price)
-    except:
-        return False
-    # сначала смотрим пользовательский лимит
-    limit = user_price_limits.get(t)
-    if limit is None:
-        limit = config.PRICE_THRESHOLDS.get(t)
-    if limit is None:
-        return False
-    try:
-        return p <= int(limit)
-    except:
-        return False
-
-def save_to_csv(items, filename=None):
-    """
-    Сохраняет candidates в outputs/candidates_YYYYMMDD_HHMMSS.csv
-    Возвращает путь к файлу или None
-    """
-    if not items:
-        return None
-    os.makedirs("outputs", exist_ok=True)
-    if not filename:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"candidates_{ts}.csv"
-    path = os.path.join("outputs", filename)
-    fieldnames = ["title","price","link","address","source","detected_type"]
-    try:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for it in items:
-                row = {k: it.get(k,"") for k in fieldnames}
-                writer.writerow(row)
-        return path
-    except Exception as e:
-        print("save_to_csv error:", e)
-        return None
+    Ищет ключевые слова из config.TYPE_KEYWORDS в title/address/description.
+    Возвращает ключ ('land','rural_house','
