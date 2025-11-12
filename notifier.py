@@ -5,24 +5,14 @@ from typing import List, Dict, Optional
 
 import config
 
-# Используем telegram.Bot напрямую (python-telegram-bot)
+# Попытка импортировать telegram.Bot
 try:
     from telegram import Bot
 except Exception:
     Bot = None
 
-# Параметры отправки
-BATCH_SIZE = 1          # сколько объявлений в одном сообщении (1 = по-одному)
-PAUSE_BETWEEN_MSGS = 0.4  # секунда (ограничение на скорость отправки)
-
-def _get_bot_and_chat() -> (Optional[object], Optional[str]):
-    token = os.getenv("BOT_TOKEN") or config.TELEGRAM.get("bot_token")
-    chat_id = os.getenv("CHAT_ID") or config.TELEGRAM.get("chat_id")
-    if not token or not chat_id:
-        return None, None
-    if Bot is None:
-        return None, chat_id
-    return Bot(token=token), str(chat_id)
+BATCH_SIZE = 1
+PAUSE_BETWEEN_MSGS = 0.4
 
 def _format_item(it: Dict) -> str:
     title = it.get("title") or ""
@@ -30,35 +20,48 @@ def _format_item(it: Dict) -> str:
     addr = it.get("address") or ""
     src = it.get("source") or ""
     link = it.get("link") or ""
-    # HTML-safe-ish formatting (we rely on Telegram parse_mode=HTML)
     return f"<b>{price} €</b> — {title}\n📍 {addr}\n🔗 {link}\nSource: {src}"
 
-def send_message(text: str) -> bool:
-    bot, chat_id = _get_bot_and_chat()
-    if not bot:
-        # Фаллбэк: печатаем в лог (удобно при локальном тестировании)
-        print("[notify - fallback] MESSAGE:")
-        print(text)
-        return False
+def _get_bot_from_env() -> Optional[object]:
+    token = os.getenv("BOT_TOKEN") or config.TELEGRAM.get("bot_token")
+    if not token or Bot is None:
+        return None
     try:
-        bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+        return Bot(token=token)
+    except Exception as e:
+        print("Notifier: failed to init Bot from env:", e)
+        return None
+
+def _send_with_bot(bot_obj, chat_id: str, text: str) -> bool:
+    try:
+        bot_obj.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
         return True
     except Exception as e:
-        print("Telegram send_message error:", e)
+        print("Notifier: telegram send error:", e)
         return False
 
-def notify_new_items(items: List[Dict]):
+def send_message_via(bot_obj, chat_id: str, text: str) -> bool:
+    if bot_obj:
+        return _send_with_bot(bot_obj, chat_id, text)
+    # fallback: try to create bot from env
+    fallback_bot = _get_bot_from_env()
+    if fallback_bot:
+        return _send_with_bot(fallback_bot, chat_id, text)
+    # final fallback: print to console
+    print("[notify fallback] ", text)
+    return False
+
+def notify_new_items(items: List[Dict], bot=None):
     """
-    Отправляет новые объекты в Telegram.
-    items — список dict с полями title, price, address, link, source.
-    Отправка идёт пачками BATCH_SIZE.
+    Отправляет новые объекты. Если bot (telegram.Bot) передан — используется он (рекомендуется).
+    Если bot не передан — пытается создать Bot из переменных окружения.
     """
     if not items:
         return
 
-    bot, chat_id = _get_bot_and_chat()
-    if not bot:
-        # Выводим в консоль, чтобы можно было увидеть, что нашёлся результат
+    chat_id = os.getenv("CHAT_ID") or config.TELEGRAM.get("chat_id")
+    if not chat_id:
+        # печатаем в консоль как fallback
         for it in items:
             print(_format_item(it))
         return
@@ -70,14 +73,9 @@ def notify_new_items(items: List[Dict]):
         if BATCH_SIZE == 1:
             text = _format_item(batch[0])
         else:
-            parts = []
-            for it in batch:
-                parts.append(_format_item(it))
-            text = "\n\n".join(parts)
-        ok = send_message(text)
+            text = "\n\n".join(_format_item(it) for it in batch)
+        ok = send_message_via(bot, chat_id, text)
         if not ok:
-            # на ошибке — печатаем пакет и продолжаем (не ломаем цикл)
-            print("Failed sending batch, continuing. Batch preview:")
-            print(text[:1000])
+            print("Notifier: failed to send message (see log).")
         time.sleep(PAUSE_BETWEEN_MSGS)
         i += BATCH_SIZE
