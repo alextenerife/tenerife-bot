@@ -1,6 +1,6 @@
 # bot.py
-# Главный файл запуска Telegram-бота для парсинга недвижимости.
-# Совместим с config.py, utils.py, notifier.py, db.py (опционально) и parsers/*.
+# Главный файл запуска Telegram-бота для парсинга недвижимости (Tenerife).
+# Совместим с config.py, user_limits.py, utils.py, notifier.py, db.py (опционально) и parsers/*.
 
 import threading
 import time
@@ -19,7 +19,7 @@ import config
 from user_limits import user_price_limits
 from utils import detect_type, is_south, is_price_ok, save_to_csv
 
-# notifier и db (db опционально)
+# notifier и db (db — опционально)
 import notifier
 try:
     from db import save_new_items as db_save_new_items
@@ -42,7 +42,7 @@ def build_main_keyboard():
         [InlineKeyboardButton("Rural House", callback_data="select_rural_house")],
         [InlineKeyboardButton("Villa", callback_data="select_villa")],
         [InlineKeyboardButton("Finca", callback_data="select_finca")],
-        [InlineKeyboardButton("▶ Run now (collect)", callback_data="collect_now")]
+        [InlineKeyboardButton("▶ Run now (collect)", callback_data="collect_now")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -78,8 +78,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         if data.startswith("select_"):
             type_name = data.split("_", 1)[1]
             options = LIMIT_OPTIONS.get(type_name, [])
-            keyboard = [[InlineKeyboardButton(f"≤{p} €", callback_data=f"set_{type_name}_{p}")] for p in options]
-            await query.edit_message_text(f"Выберите лимит цены для {type_name}:", reply_markup=InlineKeyboardMarkup(keyboard))
+            keyboard = [
+                [InlineKeyboardButton(f"≤{p} €", callback_data=f"set_{type_name}_{p}")] for p in options
+            ]
+            await query.edit_message_text(
+                f"Выберите лимит цены для {type_name}:", reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
 
         if data.startswith("set_"):
@@ -101,9 +105,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 def collect_and_notify(bot):
     """
-    Синхронная функция, выполняет парсинг всех источников, фильтрацию,
-    сохранение CSV/DB и отправку уведомлений через notifier.
-    bot: telegram.Bot (может быть None) — передаём в notifier.
+    Синхронная функция: собирает объявления со всех SOURCES, фильтрует, сохраняет CSV/DB и уведомляет.
+    bot: telegram.Bot (может быть None). Передаётся в notifier.notify_new_items.
     """
     try:
         print("Collect: starting")
@@ -201,11 +204,11 @@ def collect_and_notify(bot):
 
 def start_periodic_collect(app):
     """
-    Запускает периодический сбор в отдельном потоке.
+    Запускает фоновый поток, который периодически вызывает collect_and_notify.
     """
     interval = config.SETTINGS.get("collect_interval_seconds", 3600)
+
     def job():
-        # короткая задержка перед первым запуском
         time.sleep(5)
         while True:
             try:
@@ -219,13 +222,14 @@ def start_periodic_collect(app):
                 print("Periodic collect error:", e)
                 print(traceback.format_exc())
             time.sleep(interval)
+
     t = threading.Thread(target=job, daemon=True)
     t.start()
 
 
 def main():
     token = config.TELEGRAM.get("bot_token")
-    if not token or token.strip() == "":
+    if not token or str(token).strip() == "":
         print("BOT_TOKEN не задан в config.TELEGRAM или окружении. Выход.")
         return
 
@@ -236,10 +240,9 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_query_handler))
 
     print("Starting bot...")
-    # стартуем периодический сбор
     start_periodic_collect(app)
-    # запускаем polling (блокирующий)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
