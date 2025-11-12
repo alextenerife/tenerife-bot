@@ -1,11 +1,6 @@
 # bot.py
-"""
-Обновлённый Telegram-бот:
-- использует config.SOURCES
-- collect_and_notify принимает bot и использует notifier.notify_new_items(bot=bot)
-- поддерживает включение/отключение БД через config.SETTINGS["enable_db"]
-- периодический сбор запускается с app.bot
-"""
+# Главный файл запуска Telegram-бота для парсинга недвижимости.
+# Совместим с config.py, utils.py, notifier.py, db.py (опционально) и parsers/*.
 
 import threading
 import time
@@ -24,7 +19,7 @@ import config
 from user_limits import user_price_limits
 from utils import detect_type, is_south, is_price_ok, save_to_csv
 
-# notifier и db
+# notifier и db (db опционально)
 import notifier
 try:
     from db import save_new_items as db_save_new_items
@@ -32,13 +27,14 @@ try:
 except Exception:
     DB_MODULE_AVAILABLE = False
 
-# кнопки/лимиты
+# Быстрые опции лимитов (можно менять)
 LIMIT_OPTIONS = {
     "land": [100000, 150000, 200000, 250000],
     "rural_house": [150000, 200000, 250000, 300000],
     "villa": [250000, 300000, 350000, 400000],
     "finca": [200000, 250000, 300000, 350000]
 }
+
 
 def build_main_keyboard():
     keyboard = [
@@ -50,12 +46,14 @@ def build_main_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я бот для поиска дешевой недвижимости на юге Тенерифе.\n\n"
-        "Выберите тип для настройки лимита или нажмите 'Run now' для немедленного сбора.",
+        "Привет! Я бот для поиска дешёвой недвижимости на юге Тенерифе.\n\n"
+        "Выберите тип, чтобы установить лимит цены, или нажмите 'Run now' для немедленного сбора.",
         reply_markup=build_main_keyboard()
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -64,6 +62,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Лимиты сохраняются в памяти (user_limits.py) и используются при фильтрации."
     )
 
+
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -71,8 +70,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         if data == "collect_now":
-            await query.edit_message_text("Запуск сбора объявлений... запускаю в фоне.")
-            # запускаем сбор в фоне, передаём context.bot (telegram.Bot)
+            await query.edit_message_text("Запуск сбора объявлений... выполняю в фоне.")
+            # Запускаем сбор в фоновом потоке, передаём context.bot
             threading.Thread(target=collect_and_notify, args=(context.bot,), daemon=True).start()
             return
 
@@ -92,16 +91,19 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     except Exception as e:
         tb = traceback.format_exc()
-        print("callback handler error:", e, tb)
+        print("callback handler error:", e)
+        print(tb)
         try:
-            await query.edit_message_text("Ошибка при обработке кнопки. Смотри логи.")
-        except:
+            await query.edit_message_text("Ошибка при обработке кнопки. Проверь логи.")
+        except Exception:
             pass
+
 
 def collect_and_notify(bot):
     """
-    Сбор и уведомление.
-    bot: telegram.Bot (может быть None если собираем без контекста) — передаём в notifier.
+    Синхронная функция, выполняет парсинг всех источников, фильтрацию,
+    сохранение CSV/DB и отправку уведомлений через notifier.
+    bot: telegram.Bot (может быть None) — передаём в notifier.
     """
     try:
         print("Collect: starting")
@@ -132,8 +134,9 @@ def collect_and_notify(bot):
                 results.extend(found)
             except Exception as e:
                 print(f"[{friendly_name}] runtime error: {e}")
+                print(traceback.format_exc())
 
-        # Фильтрация и маркировка
+        # Метки и фильтрация
         candidates = []
         for it in results:
             try:
@@ -141,22 +144,23 @@ def collect_and_notify(bot):
                 it.setdefault("address", "")
                 it.setdefault("description", "")
                 it.setdefault("price", None)
-                it['detected_type'] = detect_type(it)
-                if not it['detected_type']:
+                it["detected_type"] = detect_type(it)
+                if not it["detected_type"]:
                     continue
                 if not is_south(it):
                     continue
-                # нормализация цены
+                # нормализуем цену
                 try:
-                    it['price'] = int(it['price']) if it.get('price') not in (None, "") else None
-                except:
-                    s = str(it.get('price') or "")
+                    it["price"] = int(it["price"]) if it.get("price") not in (None, "") else None
+                except Exception:
+                    s = str(it.get("price") or "")
                     s = "".join(ch for ch in s if ch.isdigit())
-                    it['price'] = int(s) if s else None
+                    it["price"] = int(s) if s else None
                 if is_price_ok(it):
                     candidates.append(it)
             except Exception as e:
                 print("item processing error:", e)
+                print(traceback.format_exc())
 
         print(f"Collect: candidates after filter = {len(candidates)}")
 
@@ -166,7 +170,7 @@ def collect_and_notify(bot):
             if csv_path:
                 print("Saved CSV:", csv_path)
 
-        # Сохранение в БД (если включено)
+        # Сохранение в БД (опционально)
         new_items = candidates
         if config.SETTINGS.get("enable_db", False) and DB_MODULE_AVAILABLE:
             try:
@@ -174,34 +178,38 @@ def collect_and_notify(bot):
                 print(f"DB: {len(new_items)} new items saved")
             except Exception as e:
                 print("DB save error:", e)
+                print(traceback.format_exc())
         else:
-            # если БД не используется — будем считать все кандидаты как 'новые'
+            # Без БД: считаем все кандидаты "новыми"
             pass
 
-        # Нотификация (передаём bot для использования notifier)
+        # Нотификация
         if new_items:
             try:
                 notifier.notify_new_items(new_items, bot=bot)
                 print(f"Notified {len(new_items)} items")
             except Exception as e:
                 print("Notify error:", e)
+                print(traceback.format_exc())
         else:
             print("No new items to notify")
 
     except Exception as e:
         print("Collect_and_notify critical error:", e)
+        print(traceback.format_exc())
+
 
 def start_periodic_collect(app):
     """
-    Запустить фоновые периодические сборы, передаём app.bot как bot.
+    Запускает периодический сбор в отдельном потоке.
     """
     interval = config.SETTINGS.get("collect_interval_seconds", 3600)
     def job():
+        # короткая задержка перед первым запуском
         time.sleep(5)
         while True:
             try:
                 print("Periodic collect triggered")
-                # app.bot доступен после ApplicationBuilder().build()
                 try:
                     bot = app.bot
                 except Exception:
@@ -209,14 +217,16 @@ def start_periodic_collect(app):
                 collect_and_notify(bot)
             except Exception as e:
                 print("Periodic collect error:", e)
+                print(traceback.format_exc())
             time.sleep(interval)
     t = threading.Thread(target=job, daemon=True)
     t.start()
 
+
 def main():
     token = config.TELEGRAM.get("bot_token")
-    if not token:
-        print("BOT_TOKEN not set in config.TELEGRAM or environment. Exiting.")
+    if not token or token.strip() == "":
+        print("BOT_TOKEN не задан в config.TELEGRAM или окружении. Выход.")
         return
 
     app = ApplicationBuilder().token(token).build()
@@ -226,9 +236,9 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_query_handler))
 
     print("Starting bot...")
-    # start periodic collector thread (will access app.bot)
+    # стартуем периодический сбор
     start_periodic_collect(app)
-    # run_polling (blocking)
+    # запускаем polling (блокирующий)
     app.run_polling()
 
 if __name__ == "__main__":
