@@ -1,94 +1,41 @@
 # parsers/idealista.py
-# Простой устойчивый парсер для Idealista (списочные страницы)
-# Возвращает list[dict] с title, price (int|None), link, address, description, source
-
-import re
-import time
-from urllib.parse import urljoin
-import requests
 from bs4 import BeautifulSoup
+from parsers._common import create_session, safe_get, polite_sleep
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TenerifeBot/1.0)"}
-
-def _parse_price(text):
-    if not text:
-        return None
-    s = re.sub(r'[^\d]', '', text)
+def parse_card(card):
     try:
-        return int(s) if s else None
-    except:
+        title_el = card.select_one("a.item-link, a > span")
+        title = title_el.get_text(strip=True) if title_el else card.get_text(strip=True)[:120]
+        link_el = card.select_one("a[itemprop='url'], a")
+        link = link_el["href"] if link_el and link_el.has_attr("href") else ""
+        price_el = card.select_one(".price, .precio, .item-price")
+        price = price_el.get_text(strip=True) if price_el else ""
+        address_el = card.select_one(".item-address, .location, .address")
+        address = address_el.get_text(strip=True) if address_el else ""
+        return {"title": title, "address": address, "price": price, "link": link}
+    except Exception as e:
+        print("idealista.parse_card error:", e)
         return None
 
-def _safe_get_text(el):
-    return el.get_text(" ", strip=True) if el else ""
-
-def parse_list_page(html, base_url, source_name="Idealista"):
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-
-    # Часто карточки имеют класс "item" или "article"
-    cards = soup.select("article, .item, .item-info-container, .ad") 
-    if not cards:
-        cards = soup.select("a[href*='/inmueble/'], a[href*='/venta-viviendas/']")
-
-    for c in cards:
-        # title
-        title_el = c.select_one("a.item-link, a[href].item-link, h2, .item-link, .title")
-        # price
-        price_el = c.select_one(".item-price, .precio, .price, .price-big, .price")
-        # link
-        link_el = c.select_one("a[href]")
-        link = ""
-        if link_el:
-            href = link_el.get("href")
-            link = href if href.startswith("http") else urljoin(base_url, href)
-        # address / district
-        addr_el = c.select_one(".item-detail, .item-detail-char, .zone, .item-location, .detail")
-        desc_el = c.select_one(".item-description, .description, p")
-
-        title = _safe_get_text(title_el)
-        price = _parse_price(_safe_get_text(price_el))
-        address = _safe_get_text(addr_el)
-        description = _safe_get_text(desc_el)
-
-        items.append({
-            "title": title or "No title",
-            "price": price,
-            "link": link,
-            "address": address,
-            "description": description,
-            "source": source_name
-        })
-    return items
-
-def get_listings(start_url, max_pages=1, delay=1.2, source_name="Idealista"):
-    results = []
-    base_url = "https://www.idealista.com"
-    for page in range(1, max_pages+1):
-        # Common Idealista pagination: 'pagina-N.htm' or '?orden=...&pagina=N'
-        url = start_url
-        if page > 1:
-            if "pagina" in start_url or "pagina-" in start_url:
-                # try to append pagina-N
-                if start_url.endswith("/"):
-                    url = f"{start_url}pagina-{page}.htm"
-                else:
-                    url = f"{start_url}pagina-{page}.htm"
-            else:
-                if "?" in start_url:
-                    url = f"{start_url}&pagina={page}"
-                else:
-                    url = f"{start_url}?pagina={page}"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"[Idealista] fetch error: {e} (url: {url})")
-            break
-        try:
-            page_items = parse_list_page(resp.text, base_url, source_name=source_name)
-            results.extend(page_items)
-        except Exception as e:
-            print(f"[Idealista] parse error: {e}")
-        time.sleep(delay)
-    return results
+def get_listings(start_url, max_pages=1, delay=1.5, source_name="Idealista"):
+    session = create_session()
+    out = []
+    for p in range(1, max_pages+1):
+        # Idealista pagination often via page number in query; tweak as needed
+        url = start_url if p == 1 else f"{start_url}?ordenado-por=fecha&page={p}"
+        html = safe_get(session, url)
+        if not html:
+            print(f"[{source_name}] fetch error for {url}")
+            polite_sleep(delay, delay + 0.5)
+            continue
+        soup = BeautifulSoup(html, "lxml")
+        # try several selectors
+        cards = soup.select(".item, .ad, .offer-item, article")
+        if not cards:
+            cards = soup.select("article")
+        for c in cards:
+            parsed = parse_card(c)
+            if parsed:
+                out.append(parsed)
+        polite_sleep(delay, delay + 0.5)
+    return out
