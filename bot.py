@@ -1,12 +1,15 @@
 # bot.py
-# Обновлённый главный файл Telegram-бота для парсинга недвижимости (Tenerife).
-# Совместим с config.py, user_limits.py, utils.py, notifier.py, db.py (опционально) и parsers/*.
+# Telegram polling bot + minimal HTTP server so Render Web Service is happy (binds a port).
+# Совместим с config.py, user_limits.py, utils.py, notifier.py, db.py и parsers/*.
 
 import threading
 import time
 import importlib
 import traceback
 import os
+from threading import Thread
+
+from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -36,14 +39,50 @@ LIMIT_OPTIONS = {
     "finca": [200000, 250000, 300000, 350000]
 }
 
-# --- Вспомогательные функции для работы с лимитами ---
+
+# --------------------------
+# Minimal HTTP server helper
+# --------------------------
+def start_http_server_in_background():
+    """
+    Запускает очень простой HTTP сервер на порту из окружения (PORT) или 8000.
+    Нужен чтобы Render при Web Service видел привязанный порт.
+    """
+    try:
+        port_env = os.getenv("PORT") or os.getenv("RENDER_INTERNAL_PORT")
+        port = int(port_env) if port_env else 8000
+    except Exception:
+        port = 8000
+
+    class _Handler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            # возвращаем короткий health-check ответ
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+
+        def log_message(self, format, *args):
+            # подавляем стандартные логи обработчика
+            return
+
+    def _run():
+        try:
+            httpd = HTTPServer(("0.0.0.0", port), _Handler)
+            print(f"[http] Listening on 0.0.0.0:{port}")
+            httpd.serve_forever()
+        except Exception as e:
+            print("[http] Server error:", e)
+
+    t = Thread(target=_run, daemon=True)
+    t.start()
+
+
+# --------------------------
+# Bot: keyboard / handlers
+# --------------------------
 def set_user_limit(user_id: int, type_name: str, price: int):
-    """
-    Сохраняет выбранный пользователем лимит в глобальном user_price_limits.
-    (user_price_limits — простой словарь в user_limits.py)
-    """
-    # В этом простом варианте мы храним глобальные лимиты (не per-user).
-    # Можно расширить — хранить per-user dict: user_price_limits[user_id][type_name] = price
+    # В простой реализации сохраняем глобально в user_price_limits
     user_price_limits[type_name] = int(price)
     print(f"[limits] Set {type_name} limit to {price} (user {user_id})")
 
@@ -83,7 +122,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     try:
         if data == "collect_now":
             await query.edit_message_text("Запуск сбора объявлений... выполняю в фоне.")
-            # Запускаем сбор в фоновом потоке, передаём context.bot
             threading.Thread(target=collect_and_notify, args=(context.bot,), daemon=True).start()
             return
 
@@ -95,7 +133,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if data.startswith("set_"):
-            # формат set_{type}_{price}
             parts = data.split("_", 2)
             if len(parts) == 3:
                 _, type_name, price_str = parts
@@ -104,7 +141,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 except Exception:
                     await query.edit_message_text("Неверный формат цены.")
                     return
-                # сохраняем лимит (в user_limits.user_price_limits)
                 uid = update.effective_user.id if update.effective_user else 0
                 set_user_limit(uid, type_name, price)
                 await query.edit_message_text(f"Лимит для {type_name} установлен: ≤{price} €")
@@ -120,11 +156,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             pass
 
 
+# --------------------------
+# Collect & notify
+# --------------------------
 def collect_and_notify(bot):
-    """
-    Синхронная функция: собирает объявления со всех SOURCES, фильтрует, сохраняет CSV/DB и уведомляет.
-    bot: telegram.Bot (может быть None). Передаётся в notifier.notify_new_items.
-    """
     try:
         print("Collect: starting")
         results = []
@@ -156,7 +191,6 @@ def collect_and_notify(bot):
                 print(f"[{friendly_name}] runtime error: {e}")
                 print(traceback.format_exc())
 
-        # Метки и фильтрация
         candidates = []
         for it in results:
             try:
@@ -169,7 +203,6 @@ def collect_and_notify(bot):
                     continue
                 if not is_south(it):
                     continue
-                # нормализуем цену попыткой привести к int
                 try:
                     it["price"] = int(it["price"]) if it.get("price") not in (None, "") else None
                 except Exception:
@@ -184,13 +217,11 @@ def collect_and_notify(bot):
 
         print(f"Collect: candidates after filter = {len(candidates)}")
 
-        # Сохранение CSV
         if config.SETTINGS.get("save_to_csv", True):
             csv_path = save_to_csv(candidates)
             if csv_path:
                 print("Saved CSV:", csv_path)
 
-        # Сохранение в БД (опционально)
         new_items = candidates
         if config.SETTINGS.get("enable_db", False) and DB_MODULE_AVAILABLE:
             try:
@@ -199,11 +230,7 @@ def collect_and_notify(bot):
             except Exception as e:
                 print("DB save error:", e)
                 print(traceback.format_exc())
-        else:
-            # Без БД: считаем все кандидаты "новыми"
-            pass
 
-        # Нотификация
         if new_items:
             try:
                 notifier.notify_new_items(new_items, bot=bot)
@@ -219,10 +246,10 @@ def collect_and_notify(bot):
         print(traceback.format_exc())
 
 
+# --------------------------
+# Periodic collect
+# --------------------------
 def start_periodic_collect(app):
-    """
-    Запускает фоновый поток, который периодически вызывает collect_and_notify.
-    """
     interval = config.SETTINGS.get("collect_interval_seconds", 3600)
 
     def job():
@@ -244,23 +271,28 @@ def start_periodic_collect(app):
     t.start()
 
 
+# --------------------------
+# Main
+# --------------------------
 def main():
     token = config.TELEGRAM.get("bot_token") or os.getenv("BOT_TOKEN", "")
     if not token or str(token).strip() == "":
         print("BOT_TOKEN не задан в config.TELEGRAM или окружении. Выход.")
         return
 
-    # --- опциональный отладочный preview (удалить в продакшн) ---
+    # optional masked preview for debug
     try:
         preview = token[:6] + "..." + token[-3:] if len(token) > 9 else token
         print("[INFO] BOT_TOKEN preview (masked):", preview)
     except Exception:
         pass
-    # ---------------------------------------------------------
+
+    # Start a minimal HTTP server so Render Web Service sees an open port
+    start_http_server_in_background()
 
     app = ApplicationBuilder().token(token).build()
 
-    # Регистрируем обработчики
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
