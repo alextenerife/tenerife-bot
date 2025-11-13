@@ -1,11 +1,12 @@
 # bot.py
-# Главный файл запуска Telegram-бота для парсинга недвижимости (Tenerife).
+# Обновлённый главный файл Telegram-бота для парсинга недвижимости (Tenerife).
 # Совместим с config.py, user_limits.py, utils.py, notifier.py, db.py (опционально) и parsers/*.
 
 import threading
 import time
 import importlib
 import traceback
+import os
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -35,6 +36,17 @@ LIMIT_OPTIONS = {
     "finca": [200000, 250000, 300000, 350000]
 }
 
+# --- Вспомогательные функции для работы с лимитами ---
+def set_user_limit(user_id: int, type_name: str, price: int):
+    """
+    Сохраняет выбранный пользователем лимит в глобальном user_price_limits.
+    (user_price_limits — простой словарь в user_limits.py)
+    """
+    # В этом простом варианте мы храним глобальные лимиты (не per-user).
+    # Можно расширить — хранить per-user dict: user_price_limits[user_id][type_name] = price
+    user_price_limits[type_name] = int(price)
+    print(f"[limits] Set {type_name} limit to {price} (user {user_id})")
+
 
 def build_main_keyboard():
     keyboard = [
@@ -58,8 +70,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start — меню\n"
-        "Кнопка 'Run now (collect)' запускает немедленный сбор\n"
-        "Лимиты сохраняются в памяти (user_limits.py) и используются при фильтрации."
+        "Нажмите кнопку с типом недвижимости, чтобы выбрать лимит.\n"
+        "Кнопка 'Run now (collect)' запускает немедленный сбор."
     )
 
 
@@ -78,27 +90,32 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         if data.startswith("select_"):
             type_name = data.split("_", 1)[1]
             options = LIMIT_OPTIONS.get(type_name, [])
-            keyboard = [
-                [InlineKeyboardButton(f"≤{p} €", callback_data=f"set_{type_name}_{p}")] for p in options
-            ]
-            await query.edit_message_text(
-                f"Выберите лимит цены для {type_name}:", reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            keyboard = [[InlineKeyboardButton(f"≤{p} €", callback_data=f"set_{type_name}_{p}")] for p in options]
+            await query.edit_message_text(f"Выберите лимит цены для {type_name}:", reply_markup=InlineKeyboardMarkup(keyboard))
             return
 
         if data.startswith("set_"):
-            _, type_name, price = data.split("_")
-            price = int(price)
-            user_price_limits[type_name] = price
-            await query.edit_message_text(f"Лимит для {type_name} установлен: {price} €")
-            return
+            # формат set_{type}_{price}
+            parts = data.split("_", 2)
+            if len(parts) == 3:
+                _, type_name, price_str = parts
+                try:
+                    price = int(price_str)
+                except Exception:
+                    await query.edit_message_text("Неверный формат цены.")
+                    return
+                # сохраняем лимит (в user_limits.user_price_limits)
+                uid = update.effective_user.id if update.effective_user else 0
+                set_user_limit(uid, type_name, price)
+                await query.edit_message_text(f"Лимит для {type_name} установлен: ≤{price} €")
+                return
 
     except Exception as e:
         tb = traceback.format_exc()
         print("callback handler error:", e)
         print(tb)
         try:
-            await query.edit_message_text("Ошибка при обработке кнопки. Проверь логи.")
+            await query.edit_message_text("Ошибка при обработке кнопки. Смотри логи.")
         except Exception:
             pass
 
@@ -152,7 +169,7 @@ def collect_and_notify(bot):
                     continue
                 if not is_south(it):
                     continue
-                # нормализуем цену
+                # нормализуем цену попыткой привести к int
                 try:
                     it["price"] = int(it["price"]) if it.get("price") not in (None, "") else None
                 except Exception:
@@ -228,13 +245,22 @@ def start_periodic_collect(app):
 
 
 def main():
-    token = config.TELEGRAM.get("bot_token")
+    token = config.TELEGRAM.get("bot_token") or os.getenv("BOT_TOKEN", "")
     if not token or str(token).strip() == "":
         print("BOT_TOKEN не задан в config.TELEGRAM или окружении. Выход.")
         return
 
+    # --- опциональный отладочный preview (удалить в продакшн) ---
+    try:
+        preview = token[:6] + "..." + token[-3:] if len(token) > 9 else token
+        print("[INFO] BOT_TOKEN preview (masked):", preview)
+    except Exception:
+        pass
+    # ---------------------------------------------------------
+
     app = ApplicationBuilder().token(token).build()
 
+    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
